@@ -1,0 +1,183 @@
+name: Sync upstream & release DEB
+
+# GitHub 无法订阅其他仓库的 push 事件，因此用定时任务轮询上游是否有更新；
+# 只有同步后版本号（package.json version）发生变化才打包发版，手动触发可强制打包。
+# 也可以手动触发，或通过 repository_dispatch 从外部即时触发。
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [sync-upstream]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-release-deb
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: jeka911/Recordly-ubuntu
+  UPSTREAM_BRANCH: main
+  FORK_BRANCH: main
+
+jobs:
+  sync:
+    name: 同步上游
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      version: ${{ steps.sync.outputs.version }}
+      version_changed: ${{ steps.sync.outputs.version_changed }}
+    steps:
+      - name: 检出 fork 分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git 身份
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 读取当前版本号
+        id: before
+        run: |
+          set -euo pipefail
+          VERSION=$(grep -m1 -E '^[[:space:]]*"version"[[:space:]]*:' package.json | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "本地版本：$VERSION"
+
+      - name: 拉取上游并判断是否有新提交
+        id: sync
+        run: |
+          set -euo pipefail
+          OLD_VERSION="${{ steps.before.outputs.version }}"
+
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || \
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+
+          UPSTREAM_SHA=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")
+          LOCAL_SHA=$(git rev-parse HEAD)
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          echo "upstream=$UPSTREAM_SHA local=$LOCAL_SHA"
+
+          if [ "$UPSTREAM_SHA" = "$LOCAL_SHA" ] || git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD; then
+            echo "本地已包含上游最新提交，无需同步。"
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "version=$OLD_VERSION" >> "$GITHUB_OUTPUT"
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "::error::合并上游时发生冲突，请手动解决后再重试。"
+            git merge --abort || true
+            exit 1
+          fi
+
+          git push origin "HEAD:${FORK_BRANCH}"
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "已同步上游提交并把合并结果推送到 ${FORK_BRANCH}。"
+
+          NEW_VERSION=$(grep -m1 -E '^[[:space:]]*"version"[[:space:]]*:' package.json | sed -E 's/.*:[[:space:]]*"([^"]+)".*/\1/')
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
+            echo "version_changed=true" >> "$GITHUB_OUTPUT"
+            echo "版本号变化：$OLD_VERSION -> $NEW_VERSION，将触发 DEB 打包。"
+          else
+            echo "version_changed=false" >> "$GITHUB_OUTPUT"
+            echo "本次同步版本号未变（$NEW_VERSION），跳过 DEB 打包。"
+          fi
+
+  build-deb:
+    name: 打包 DEB 并发布到 Release
+    needs: sync
+    if: >-
+      needs.sync.outputs.version_changed == 'true' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'repository_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出同步后的分支
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 Linux 原生构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxt-dev libxtst-dev libxkbfile-dev libxi-dev libxrandr-dev libxinerama-dev
+
+      - name: 安装项目依赖
+        run: npm ci --ignore-scripts
+
+      - name: 安装并校验内置 FFmpeg
+        run: |
+          node scripts/install-ffmpeg-static.mjs
+          node -e "const fs=require('node:fs'); const ffmpeg=require('ffmpeg-static'); if (typeof ffmpeg !== 'string' || !fs.existsSync(ffmpeg)) { throw new Error('Bundled ffmpeg-static binary is missing: ' + ffmpeg); } console.log('Using bundled ffmpeg binary: ' + ffmpeg);"
+
+      - name: 准备原生模块
+        run: |
+          rm -rf node_modules/uiohook-napi/build
+          npx electron-builder install-app-deps
+
+      - name: 构建 DEB
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npm run build:platform-native-helpers
+          npx tsc
+          npx vite build
+          npx electron-builder --linux deb --x64 --publish never
+
+      - name: 生成 DEB 校验和
+        run: |
+          cd release
+          deb_count=$(find . -maxdepth 1 -name '*.deb' | wc -l)
+          if [ "$deb_count" -eq 0 ]; then
+            echo "::error::未找到任何 .deb 构建产物。"
+            exit 1
+          fi
+          sha256sum ./*.deb > SHA256SUMS-deb.txt
+          cat SHA256SUMS-deb.txt
+
+      - name: 发布 DEB 到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(git rev-parse HEAD)
+          TAG="v${VERSION}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              release/*.deb release/SHA256SUMS-deb.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" \
+              release/*.deb release/SHA256SUMS-deb.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Recordly DEB ${VERSION}" \
+              --notes "自动同步上游 ${UPSTREAM_REPO} 后按版本 ${VERSION} 打包。源码提交：${HEAD_SHA}。"
+          fi
+
+          echo "已发布 DEB 到 https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
