@@ -139,6 +139,18 @@ jobs:
           rm -rf node_modules/uiohook-napi/build
           npx electron-builder install-app-deps
 
+      - name: 注入 DEB 打包所需的作者邮箱
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.author = {
+              name: typeof p.author === 'string' ? p.author : (p.author.name || 'Recordly'),
+              email: 'noreply@github.com',
+            };
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
       - name: 构建 DEB
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
